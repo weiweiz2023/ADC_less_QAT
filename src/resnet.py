@@ -66,7 +66,7 @@ class BasicBlock_Quant(nn.Module):
         start_time = time.time()
         
         # 第一个卷积层 - 收集VQ损失
-        out, vq_loss1 = self.conv1(x)  # 这里返回的是VQ损失，不是ADC损失
+        out, vq_loss1,adc_loss1 = self.conv1(x)  
         out = self.bn1(out)
         shortcut_out = self.shortcut(x) 
         out += shortcut_out
@@ -76,7 +76,7 @@ class BasicBlock_Quant(nn.Module):
             out = self.prune(out)
             
         # 第二个卷积层 - 收集VQ损失
-        out, vq_loss2 = self.conv2(out)  # 这里返回的是VQ损失，不是ADC损失
+        out, vq_loss2,adc_loss2 = self.conv2(out)  
         out = self.bn1(out)
         out = self.bn2(out)
         out = out + x1
@@ -84,12 +84,12 @@ class BasicBlock_Quant(nn.Module):
         
         # 正确累积VQ损失
         total_vq_loss = L0 + vq_loss1 + vq_loss2
-        
+        total_ADC_loss = L0 + adc_loss1 + adc_loss2
         # 添加调试输出
         # print(f"DEBUG BasicBlock: vq_loss1={vq_loss1:.6f}, vq_loss2={vq_loss2:.6f}, " +
         #     f"input_loss={L0:.6f}, total={total_vq_loss:.6f}")
         
-        return [out, total_vq_loss]  # 返回累积的VQ损失
+        return [out, total_vq_loss,total_ADC_loss]  # 返回累积的VQ损失
 
     # 同时修改ResNet.forward方法，确保损失正确传播
 
@@ -135,10 +135,10 @@ class ResNet(nn.Module):
         # [out, L2] =  checkpoint (self.layer2, [out, L1], use_reentrant=False )
         # [out, L3] =  checkpoint (self.layer3, [out, L2], use_reentrant=False )
         # [out, L4] =  checkpoint (self.layer4, [out, L3], use_reentrant=False )
-        [out, VQ1] = self.layer1([out, 0])
-        [out, VQ2] = self.layer2([out, VQ1])
-        [out, VQ3] = self.layer3([out, VQ2])  
-        [out, VQ4] = self.layer4([out, VQ3])
+        [out, VQ1,ADC1] = self.layer1([out, 0,0])
+        [out, VQ2,ADC2] = self.layer2([out, VQ1,ADC1])
+        [out, VQ3,ADC3] = self.layer3([out, VQ2,ADC2])  
+        [out, VQ4,ADC4] = self.layer4([out, VQ3,ADC3])
         
         # 分类器
         out = F.avg_pool2d(out, out.size()[3])
@@ -153,5 +153,5 @@ class ResNet(nn.Module):
         #     f"VQ3={VQ3:.6f}, Final VQ4={VQ4:.6f}")
         
         # 返回分类输出和总VQ损失
-        return out, VQ4 
+        return out, VQ4 ,ADC4
        

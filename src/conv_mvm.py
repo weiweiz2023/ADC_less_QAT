@@ -1,3 +1,6 @@
+
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -259,7 +262,8 @@ class quantized_conv(nn.Module):
         
         pos_weight_matrix = pos_slices.view(self.out_channels, -1, self.weight_slices)
         neg_weight_matrix = neg_slices.view(self.out_channels, -1, self.weight_slices)
-        
+
+        total_adc_loss = torch.tensor(0.0, device=inputs.device)  # 初始化总ADC损失
         # Rest of the computation (same as your existing implementation)
         if self.num_subarrays > 1:
             input_chunks = torch.chunk(input_streams, self.num_subarrays, dim=1)
@@ -268,14 +272,14 @@ class quantized_conv(nn.Module):
             
             results = []
             for input_chunk, pos_chunk, neg_chunk in zip(input_chunks, pos_chunks, neg_chunks):
-                chunk_result = self._process_subarray_vectorized(
+                chunk_result, chunk_loss = self._process_subarray_vectorized(
                     input_chunk, pos_chunk, neg_chunk, batch_size
                 )
                 results.append(chunk_result)
-            
+                total_adc_loss = total_adc_loss + chunk_loss
             final_output = torch.stack(results, dim=0).sum(dim=0)
         else:
-            final_output = self._process_subarray_vectorized(
+            final_output, total_adc_loss  = self._process_subarray_vectorized(
                 input_streams, pos_weight_matrix, neg_weight_matrix, batch_size
             )
         
@@ -288,7 +292,7 @@ class quantized_conv(nn.Module):
         output_w = self._calc_output_size(inputs.shape[3], 1)
         output = F.fold(final_output, (output_h, output_w), (1, 1))
         #print(f"DEBUG: Final VQ loss = {vq_loss}")
-        return output, vq_loss
+        return output, vq_loss, total_adc_loss 
     
     def _process_subarray_vectorized(self, input_chunk, weight_pos_chunk, weight_neg_chunk, batch_size):
         # Same implementation as your existing method
@@ -324,7 +328,7 @@ class quantized_conv(nn.Module):
         pos_final = pos_scaled.sum(dim=(-2, -1))
         neg_final = neg_scaled.sum(dim=(-2, -1))
         
-        return pos_final - neg_final
+        return pos_final - neg_final, total_adc_loss
     
     def _calc_output_size(self, input_size, dim):
         kernel = self.kernel_size
@@ -336,8 +340,8 @@ class quantized_conv(nn.Module):
     def forward(self, inputs):
         if self.experiment_state == "PTQAT" and self.num_subarrays > 0:
             if self.weight_bits > 0 or self.input_bits > 0:
-                output, vq_loss = self.compute_vectorized_conv_vq(inputs, self.weight)
-                return output, vq_loss  # Return VQ loss to be added to total loss
+                output, vq_loss, total_adc_loss  = self.compute_vectorized_conv_vq(inputs, self.weight)
+                return output, vq_loss, total_adc_loss   # Return VQ loss to be added to total loss
             else:
                 return F.conv2d(inputs, self.weight, bias=None,
                               stride=self.stride, padding=self.padding,
