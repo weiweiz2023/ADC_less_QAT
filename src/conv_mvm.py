@@ -1,6 +1,7 @@
 
 
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -198,7 +199,8 @@ class quantized_conv(nn.Module):
         self.adc_bits = arch_args.adc_bit
         self.adc_grad_filter = arch_args.adc_grad_filter
         self.save_adc_data = arch_args.save_adc
-        
+        self.adc_custom_loss = arch_args.adc_custom_loss
+        self.adc_reg_lambda = arch_args.adc_reg_lambda
         # Conv parameters
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -235,9 +237,9 @@ class quantized_conv(nn.Module):
         # ADC modules (keep your existing ADC setup)
         from src.adc_module import Nbit_ADC
         self.adc_pos = Nbit_ADC(self.adc_bits, self.weight_slices, self.input_streams, 
-                               self.save_adc_data, self.adc_grad_filter)
+                               self.save_adc_data, self.adc_grad_filter,self.adc_custom_loss,self.adc_reg_lambda)
         self.adc_neg = Nbit_ADC(self.adc_bits, self.weight_slices, self.input_streams, 
-                               self.save_adc_data, self.adc_grad_filter)
+                               self.save_adc_data, self.adc_grad_filter,self.adc_custom_loss,self.adc_reg_lambda)
     
     def compute_vectorized_conv_vq(self, inputs, weights):
         # print(f"DEBUG: use_vq = {self.use_vq}")
