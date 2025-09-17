@@ -19,11 +19,11 @@ from src.adc_module import Nbit_ADC
 import os
 from torch.utils.checkpoint import checkpoint
 from torch.cuda.amp import autocast, GradScaler
-from src.test import QuantizationComparator
+
 
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 args = argsparser.get_parser().parse_args()
 best_prec1 = 0
 
@@ -325,7 +325,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    vq_losses = AverageMeter()  
+    vq_losses = AverageMeter()
+    adc_losses = AverageMeter()  
      
     # switch to train mode
     model.train()
@@ -345,15 +346,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # compute output
         start_forward = time.time()
-        output, vq_loss = model(input_var)
+        output, vq_loss,adc_loss = model(input_var)
 
         vq_losses.update(vq_loss.item(), input.size(0))
-        
+        adc_losses.update(adc_loss.item(), input.size(0)) 
         if i % args.print_freq == 0:
             print(f'VQ_Loss {args.vq_loss_weight * vq_losses.val:.6f} ({args.vq_loss_weight * vq_losses.avg:.6f})')
-        forward_time = time.time() - start_forward
+            print(f'adc_Loss {args.adc_reg_lambda* adc_losses.val:.6f} ({args.adc_reg_lambda * adc_losses.avg:.6f})')
+         
         start_backward = time.time()
-        loss = criterion(output, target_var) +args.vq_loss_weight * vq_loss
+        loss = criterion(output, target_var) +args.vq_loss_weight * vq_loss+ args.adc_reg_lambda * adc_loss
         # if args.viz_comp_graph:
         #     torchviz.make_dot(output).render("./saved/torchviz_out", format="png")
         #     torchviz.make_dot(loss).render("./saved/torchviz_loss", format="png")
