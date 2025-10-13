@@ -1,4 +1,8 @@
 import os
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import time
 import torch
 import torch.nn as nn
@@ -18,12 +22,14 @@ from src.pruning import prune_model , apply_pruning
 from src.adc_module import Nbit_ADC
 import os
 from torch.utils.checkpoint import checkpoint
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler 
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
+from src.adc_module import gradientFilter
 
 
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "3"
 args = argsparser.get_parser().parse_args()
 best_prec1 = 0
 
@@ -45,7 +51,7 @@ model_params = [args.model,
                 # args.acm_fixed_bits,
                 # args.acm_frac_bits,
                 args.calibrate_adc,
-                args.vq_loss_weight
+                
                 ]
 quant_add = "_"
 for item in model_params:
@@ -93,7 +99,12 @@ def main():
     global args, best_prec1
     print(f"Time @ args: {time.time() - start_time}")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("✓ CUDNN optimizations enabled")
     # Build model according to params
     if args.model == "resnet20":
         num_blocks = [3, 3, 3]
@@ -150,30 +161,38 @@ def main():
     print(f"Time @ data load: {time.time()-start_time}")
 
     criterion = nn.CrossEntropyLoss().cuda()
-
-
-    optimizer = torch.optim.AdamW(model.parameters(), 
-                            lr=1e-3,
-                            weight_decay=5e-4,  # AdamW可以用更大的weight_decay
-                            betas=(0.9, 0.999))
-    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, 
-    #                                weight_decay=args.weight_decay)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
    
+   
+    
+    # ========== 新的 scheduler 配置 ==========
+   
+    # warmup_epochs = 5
+    # total_epochs = args.epochs
+    # def lr_lambda(epoch):
+    #     if epoch < warmup_epochs:
+    #         # Warmup: 从 0.1 线性增加到 1.0
+    #         return 0.1 + 0.9 * (epoch / warmup_epochs)
+    #     else:
+    #         # Cosine annealing: 从 1.0 衰减到 eta_min_ratio
+    #         progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+    #         eta_min_ratio = 1e-6 / args.lr  # 最小LR占初始LR的比例
+    #         return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
+    # lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # ========== end==========
+    
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6, last_epoch=-1)
-
-    # print(model.modules)  # Print all model components/layers
+ 
+     
     start_train = time.time()
-
+    
     print(f"Time @ start: {time.time()-start_time}")
     
 
-    # if (len(args.resume) > 5) and args.save_adc:
-    #     model.eval() 
-    #     with torch.no_grad():
-    #         prec1 = validate(val_loader, model, criterion)
-    #     print(f"推理完成，准确率: {prec1:.2f}%")
-    #     exit()
+ 
     if (len(args.resume) > 5) and args.save_adc:        
         validate(val_loader, model, criterion)
         exit()
@@ -184,12 +203,61 @@ def main():
         with torch.no_grad():
             validate(val_loader, model, criterion)
         exit()
-    #if (len(args.resume) > 5) and args.experiment_state == "PTQAT":        
-    #    validate(val_loader, model, criterion)
-   #     exit()
-
-
-
+    
+       
+# ==========================================
+# VQ Calibration Step (before training)
+# ==========================================
+    if args.experiment_state == "PTQAT" and args.use_vq:
+        print("=" * 60)
+        print("开始VQ码本校准（K-means初始化）")
+        print("=" * 60)
+        
+        model.eval()
+        
+        for name, module in model.named_modules():
+            if hasattr(module, 'vq_layer') and module.vq_layer is not None:
+                print(f"校准层: {name}")
+                
+                # 获取该层权重
+                weights = module.weight.data.flatten()
+                
+                # 采样权重
+                num_samples = min(10000, len(weights))
+                indices = torch.randperm(len(weights))[:num_samples]
+                samples = weights[indices].unsqueeze(1)
+                
+                # 用分位数初始化码本
+                sorted_weights = torch.sort(samples.squeeze())[0]
+                num_codes = module.vq_layer.num_embeddings
+                quantile_indices = torch.linspace(0, len(sorted_weights)-1, num_codes).long()
+                centroids = sorted_weights[quantile_indices].unsqueeze(1)
+                
+                # 运行5轮K-means
+                for _ in range(10):
+                    # 分配到最近中心
+                    distances = torch.cdist(samples, centroids)
+                    assignments = torch.argmin(distances, dim=1)
+                    
+                    # 更新中心
+                    new_centroids = []
+                    for k in range(num_codes):
+                        mask = assignments == k
+                        if mask.sum() > 0:
+                            new_centroids.append(samples[mask].mean(dim=0, keepdim=True))
+                        else:
+                            new_centroids.append(centroids[k:k+1])
+                    centroids = torch.cat(new_centroids, dim=0)
+                
+                # 更新VQ码本
+                module.vq_layer.embedding.weight.data = centroids
+                
+                print(f"  码本范围: [{centroids.min():.4f}, {centroids.max():.4f}]")
+        
+        print("VQ码本校准完成！")
+# ==========================================
+    # end of VQ calibration step
+    # ==========================================
     # ==========================================
     # new: PTQAT calibration step
     # This step is only executed if args.experiment_state is "PTQAT" and
@@ -276,6 +344,8 @@ def main():
     # ==========================================
     # end of PTQAT calibration step
     # ==========================================
+ 
+    
 
     # begin epoch training loop
     for epoch in range(0, args.epochs):
@@ -284,7 +354,7 @@ def main():
             prune_model(model, args.conv_prune_rate, args.linear_prune_rate)
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
 
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, criterion, optimizer, epoch )
         lr_scheduler.step()
 
         # evaluate on validation set
@@ -315,9 +385,7 @@ def main():
 
 
 
-
-
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch ):
     """
         Run one train epoch
     """
@@ -328,6 +396,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
     vq_losses = AverageMeter()
     adc_losses = AverageMeter()  
      
+     
+    # 🆕 添加这里 - 动态VQ损失权重
+    if args.use_vq:
+        # 指数衰减：epoch 0→1, epoch 5→0.5, epoch 10→0.25
+        vq_weight = args.vq_loss_weight * (0.5 ** (epoch / 5))
+        print(f'VQ Loss Weight: {vq_weight:.6f} (原始: {args.vq_loss_weight})')
+    else:
+        vq_weight = 0.0
+    # 🆕 添加结束
+
     # switch to train mode
     model.train()
 
@@ -345,29 +423,28 @@ def train(train_loader, model, criterion, optimizer, epoch):
         target_var = torch.autograd.Variable(target.cuda())
 
         # compute output
-        start_forward = time.time()
-        output, vq_loss,adc_loss = model(input_var)
-
-        vq_losses.update(vq_loss.item(), input.size(0))
-        adc_losses.update(adc_loss.item(), input.size(0)) 
-        if i % args.print_freq == 0:
-            print(f'VQ_Loss {args.vq_loss_weight * vq_losses.val:.6f} ({args.vq_loss_weight * vq_losses.avg:.6f})')
-            print(f'adc_Loss {args.adc_reg_lambda* adc_losses.val:.6f} ({args.adc_reg_lambda * adc_losses.avg:.6f})')
-         
+        start_forward = time.time() 
+        output,vq_loss = model(input_var)
+        #print("vq_loss",vq_loss) 
         start_backward = time.time()
-        loss = criterion(output, target_var) +args.vq_loss_weight * vq_loss+ args.adc_reg_lambda * adc_loss
-        # if args.viz_comp_graph:
-        #     torchviz.make_dot(output).render("./saved/torchviz_out", format="png")
-        #     torchviz.make_dot(loss).render("./saved/torchviz_loss", format="png")
-        #     exit()
-
-        # compute gradient and do SGD step
+        for module in model.modules():
+            if hasattr(module, 'last_vq_loss'):
+                vq_loss += module.last_vq_loss
+        
+        vq_losses.update(vq_loss.item(), input.size(0))
+        loss = criterion(output, target_var)+  vq_weight *  vq_loss 
+        
+       
      
         optimizer.zero_grad()
+        # scaler.scale(loss).backward()
+        # scaler.step(optimizer)
+        # scaler.update() 
+
         loss.backward()
         optimizer.step() 
         
-        # output = output.float()
+        
         loss = loss.float()
         backward_time = time.time() - start_backward
         # measure accuracy and record loss
@@ -385,6 +462,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  f'VQ Loss {vq_losses.val:.6f} ({vq_losses.avg:.6f})\t'  # 🆕 添加这行
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
                       epoch+1, i+1, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
@@ -412,9 +490,9 @@ def validate(val_loader, model, criterion):
             target_var = torch.autograd.Variable(target.cuda())
 
         # compute output
-            output, loss_add = model(input_var)
-
-            loss = criterion(output, target_var) + loss_add
+           # output, vq_loss,adc_loss  = model(input_var)
+            output ,vq_loss  = model(input_var)
+            loss = criterion(output, target_var)  +   vq_loss  
 
             output = output.float()
             loss = loss.float()
