@@ -6,6 +6,7 @@ import numpy as np
 import os
 import random
 
+
 class Nbit_ADC(nn.Module):
     def __init__(self, bits: int, n_state_slices: int, n_state_stream: int, save_adc: bool,
                  adc_grad_filter: bool, custom_loss: bool = False, regularization_lambda: float = 0.01):
@@ -15,8 +16,8 @@ class Nbit_ADC(nn.Module):
         self.grad_filter = adc_grad_filter 
         self.custom_loss = custom_loss  # 添加缺失的属性
         self.reg_lambda = regularization_lambda  # 正则化系数
-        n_slices = n_state_slices
-        n_stream = n_state_stream
+        self.n_slices = n_state_slices
+        self. n_stream = n_state_stream
         self.calibrating = False
         self.cal_data = []
         
@@ -26,8 +27,7 @@ class Nbit_ADC(nn.Module):
         self.sampling_probability = 1.0  # Dynamic sampling probability
         self.collection_completed = False   
         
-        # Use register_buffer for state parameters
-         #self.step_size = nn.Parameter(torch.tensor(1.0))
+        #self.step_size = nn.Parameter(torch.tensor(1.0))
         self.register_buffer('step_size', torch.tensor(1.0))
         self.register_buffer('zero_point', torch.tensor(0.0))
         self.register_buffer('min_val_base', torch.tensor(0.0))
@@ -120,41 +120,35 @@ class Nbit_ADC(nn.Module):
             adc_name = getattr(self, 'adc_name', 'unknown')
             print(f"ADC {adc_name}: COMPLETED {self.saved_points}/{self.max_save_points} points")
             self.collection_completed = True
-   
+    
     def forward(self, x):
-        # Calibration data collection
-        if self.calibrating and len(self.cal_data) <30:
-            self.cal_data.append(x.flatten().cpu().detach())
-        
 
-        #torch.clamp(self.step_size, min=1e-8) 
-        # ADC quantization
-        original_shape = x.shape
-        scale_offset = x / self.step_size - self.zero_point  
-        y = (torch.round(scale_offset) * self.step_size).detach() + x - x.detach()
-        num_levels = 2 ** self.bits  # 2^bits个量化level
-        min_val = 0 * self.step_size
-        max_val = (num_levels - 1) * self.step_size
-        
-         
-        min_val = (min_val * self.step_size).clone().detach().to(device=y.device, dtype=y.dtype)
-        max_val = (max_val * self.step_size).clone().detach().to(device=y.device, dtype=y.dtype) 
-        y = y.clamp(min_val, max_val)
-        
-
-
-        if self.save and self.saved_points < self.max_save_points:
-            self._sample_and_save_data(x, y)
-        loss = 0  
-
-        if self.custom_loss:
-            loss = torch.mean(abs(x - y)**2 ) 
-            # if random.random() < 0.001:  
-            #     print(f" ADCloss: {loss.item():.6f}")
-  
-        y = gradientFilter.apply(y, min_val, max_val,self.grad_filter,x)
+            # Calibration data collection
+            if self.calibrating and len(self.cal_data) < 30:
+                self.cal_data.append(x.flatten().cpu().detach())
+            step_size = torch.clamp(self.step_size, min=1e-6, max=1e2)
             
-        return y, loss
+            
+            original_shape = x.shape
+            scale_offset = x / step_size - self.zero_point  
+            y =   step_size*torch.round(scale_offset).detach()  + x - x.detach()
+            
+            min_val = 0 * step_size
+            max_val = (2 ** self.bits - 1) * step_size
+            
+            min_val = (min_val * step_size).clone().detach().to(device=y.device, dtype=y.dtype)
+            max_val = (max_val * step_size).clone().detach().to(device=y.device, dtype=y.dtype) 
+            y = y.clamp(min_val, max_val)
+             
+            if self.save and self.saved_points < self.max_save_points:
+                self._sample_and_save_data(x, y)
+            
+            loss = 0  
+           
+            
+            y = gradientFilter.apply(y, min_val, max_val, self.grad_filter, x)
+            
+            return y, loss
 
     def reset_data_collection(self):
         """Reset data collection counters (useful for multiple runs)"""
@@ -171,6 +165,8 @@ class Nbit_ADC(nn.Module):
         }
 
 
+
+        
 class gradientFilter(Function):
     @staticmethod
     def forward(ctx, input_tens, min_val, max_val,grad_filter,raw_tens):
@@ -189,47 +185,18 @@ class gradientFilter(Function):
         max_val = ctx.max_val
         min_val = ctx.min_val
         raw_tens,input_tens = ctx.saved_tensors
-    #   # ============ 记录原始梯度统计 ============
-    #     original_grad_mean = grad_output.mean().item()
-    #     original_grad_std = grad_output.std().item()
-    #     original_grad_max = grad_output.abs().max().item()
-        if ctx.grad_filter:
+        # if ctx.grad_filter:
             
-            scale1 = torch.clamp( 0.2 +torch.log( raw_tens+max_val-1 ) /3, min=0, max=1.0)
-            #scale1 = torch.clamp( (0.2 + torch.sqrt(raw_tens - 1)) / 3 , min=0, max=1.0)
+        #     scale1 = torch.clamp( 0.2 +torch.log( raw_tens+max_val-1 ) /3, min=0, max=1.0)
+        #     scale3 =(torch.sin(( raw_tens - 0.25*max_val) * torch.pi * 2/max_val) + 1) * 0.4 + 0.2
+        #     grad_out = torch.where(raw_tens >= min_val, scale3 * grad_output ,0.1 * grad_output)
+        #     grad_out = torch.where(raw_tens < max_val, grad_out,  scale1* grad_output  )
              
-           # scale3 = torch.clamp(torch.abs(torch.sin(raw_tens * torch.pi)) * 0.8+ 0.2, min=0, max=1.0)
-            scale3 =(torch.sin(( raw_tens - 0.25*max_val) * torch.pi * 2/max_val) + 1) * 0.4 + 0.2
-            grad_out = torch.where(raw_tens >= min_val, scale3 * grad_output ,0.1 * grad_output)
-            grad_out = torch.where(raw_tens < max_val, grad_out,  scale1* grad_output  )
+        # else:
              
-            # if random.random() < 0.001:
-            #     print(f"With filter - grad_out mean: {grad_out.mean():.6f}, std: {grad_out.std():.6f}")
-        else:
+        grad_out = torch.where(raw_tens >=  max_val,  grad_output, 0.1 * grad_output)
+        grad_out = torch.where(raw_tens <=   max_val , grad_out,0.1 * grad_output)
+            # grad_out = torch.where(raw_tens >   min_val,  grad_output, 0 )
+            # grad_out = torch.where(raw_tens <=    max_val , grad_out,0 )
              
-            grad_out = torch.where(raw_tens >  min_val,  grad_output, 0.1 * grad_output)
-            grad_out = torch.where(raw_tens <=   max_val , grad_out,0.1 * grad_output)
-          # ============ 记录过滤后的梯度统计 ============
-        # filtered_grad_mean = grad_out.mean().item()
-        # filtered_grad_std = grad_out.std().item()
-        # filtered_grad_max = grad_out.abs().max().item()
-        
-        # # ============ 保存到文件 ============
-        # import os
-        # import random
-        # if random.random() < 0.001:  # 采样1%的batch
-        #     os.makedirs("./saved/gradient_analysis/", exist_ok=True)
-        #     with open("./saved/gradient_analysis/gradient_stats.csv", "a") as f:
-        #         # 写入: filter_enabled, orig_mean, orig_std, orig_max, filt_mean, filt_std, filt_max
-        #         f.write(f"{ctx.grad_filter},{original_grad_mean:.6f},{original_grad_std:.6f},"
-        #                f"{original_grad_max:.6f},{filtered_grad_mean:.6f},{filtered_grad_std:.6f},"
-        #                f"{filtered_grad_max:.6f}\n")
-        
-        # return   grad_out,None, None, None, None
-            
-            
-            # if random.random() < 0.001:
-            #     print(f"Without filter - grad_out mean: {grad_out.mean():.6f}, std: {grad_out.std():.6f}")
- 
-
         return grad_out, None, None, None, None
