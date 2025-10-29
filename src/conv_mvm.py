@@ -1,110 +1,5 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Function
-from src.adc_module import Nbit_ADC
 
-class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim):
-        super().__init__()
-        self.num_embeddings = num_embeddings  # 16 for 4-bit
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        # 初始化码本为均匀分布
-        self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
-    
-    def forward(self, weights_flat):
-        # 计算到所有码本的距离
-        distances = torch.cdist(weights_flat, self.embedding.weight)
         
-        # 找最近的码本索引
-        indices = torch.argmin(distances, dim=1)
-        
-        # 量化
-        quantized = F.embedding(indices, self.embedding.weight)
-        
-        # 计算VQ损失
-        vq_loss = F.mse_loss(quantized.detach(), weights_flat) + \
-                  0.1 * F.mse_loss(quantized, weights_flat.detach())
-        
-        # 直通估计器
-        quantized = weights_flat + (quantized - weights_flat).detach()
-        
-        return quantized, vq_loss    
-    
-class VectorizedWeightBitSlicing(Function):
-    @staticmethod
-    def forward(ctx, weights, weight_bits, bits_per_slice):
-        ctx.save_for_backward(weights)
-        ctx.weight_bits = weight_bits
-        ctx.bits_per_slice = bits_per_slice
-        weights_pos = torch.clamp(weights, min=0.0)
-        weights_neg = torch.clamp(-weights, min=0.0)
-        
-        max_abs = max(weights_pos.max(), weights_neg.max())
-        ctx.max_abs = max_abs
-        if max_abs > 0:
-            weights_pos = weights_pos / max_abs
-            weights_neg = weights_neg / max_abs
-        else:
-            max_abs = 1.0
-        
-        max_val = (2 ** weight_bits) - 1
-        pos_int = torch.round(weights_pos * max_val).int()
-        neg_int = torch.round(weights_neg * max_val).int()
-        
-        num_slices = weight_bits // bits_per_slice
-        bit_positions = torch.arange(0, weight_bits, bits_per_slice, device=weights.device)
-        
-        pos_slices = (pos_int.unsqueeze(-1) >> bit_positions) & ((1 << bits_per_slice) - 1)
-        neg_slices = (neg_int.unsqueeze(-1) >> bit_positions) & ((1 << bits_per_slice) - 1)
-        
-        return pos_slices.float(), neg_slices.float(), max_abs
-    
-    @staticmethod
-    def backward(ctx, grad_pos, grad_neg, grad_norm):
-        weights, = ctx.saved_tensors
-        max_abs = ctx.max_abs
-        grad_input = torch.where(weights >= 0, 
-                                grad_pos.mean(dim=-1), 
-                                -grad_neg.mean(dim=-1))
-        grad_input = torch.clamp(grad_input, -1.0, 1.0)
-        
-        return grad_input, None, None
-
-class VectorizedInputBitStreaming(Function):
-    @staticmethod
-    def forward(ctx, inputs, input_bits, frac_bits, bits_per_stream, num_streams):
-        ctx.save_for_backward(inputs)
-        ctx.input_bits = input_bits
-        ctx.frac_bits = frac_bits
-        ctx.bits_per_stream = bits_per_stream
-        int_bits = input_bits - frac_bits - 1
-        max_val = 2**int_bits - 2**(-frac_bits)
-        ctx.max_val = max_val
-        inputs_quantized = torch.round(
-            torch.clamp(inputs, -2**int_bits, max_val) * (2**frac_bits)).to(torch.int32)
-        
-        negative_mask = inputs_quantized < 0
-        inputs_quantized = torch.where(negative_mask,
-                                     (1 << input_bits) + inputs_quantized,
-                                     inputs_quantized)
-        
-        bit_positions = torch.arange(0, input_bits, bits_per_stream, device=inputs.device)
-        streams = (inputs_quantized.unsqueeze(-1) >> bit_positions) & ((1 << bits_per_stream) - 1)
-        
-        return streams.float()
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        inputs, = ctx.saved_tensors
-        int_bits = ctx.input_bits - ctx.frac_bits - 1
-        min_val = -2**int_bits
-        max_val = 2**int_bits - 2**(-ctx.frac_bits)
-        grad_input = torch.where(inputs > min_val, grad_output.mean(dim=-1), 0)
-        grad_input = torch.where(inputs < max_val, grad_input, 0)
-        grad_input = torch.clamp(grad_input, -1.0, 1.0)
-        return grad_input, None, None, None, None
-
 class quantized_conv(nn.Module):
     def __init__(self, in_channels, out_channels, arch_args, 
                  kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=None):
@@ -136,9 +31,9 @@ class quantized_conv(nn.Module):
         self.dilation = (dilation, dilation)
         self.groups = groups
 
-        self.adc_slice_weighting = getattr(arch_args, 'adc_slice_weighting', 'exponential')
-        self.adc_slice_weight_scale = getattr(arch_args, 'adc_slice_weight_scale', 1.0)
-        
+        self.layer_name = None  # 会在外部设置
+        self.stats_list = []
+
         subarray_size = arch_args.subarray_size
         if subarray_size <= 0:
             self.num_subarrays = 0
@@ -152,7 +47,8 @@ class quantized_conv(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
         nn.init.kaiming_normal_(self.weight)
         
-        # ADC modules
+       
+       
         self.adc_pos = Nbit_ADC(self.adc_bits, self.weight_slices, self.input_streams, 
                                self.save_adc_data, self.adc_grad_filter,
                                self.adc_custom_loss, self.adc_reg_lambda)
@@ -166,38 +62,40 @@ class quantized_conv(nn.Module):
         
         self.register_buffer('stream_scale', stream_weights.view(1, 1, 1, -1, 1))
         self.register_buffer('slice_scale', slice_weights.view(1, 1, 1, 1, -1))
-        #  VQ 
-        if arch_args.use_vq:
-            num_embeddings = 2 ** self.weight_bits  # 4位 = 16个码本
-            self.vq_layer = VectorQuantizer(num_embeddings, embedding_dim=1)
-        else:
-            self.vq_layer = None
+    def _fix_input_sign_bit(self, ps):
+        """
+        修正补码input的符号位
+        
+        补码的符号位(MSB)权重应该是负的，但MVM按正数算了
+        解决：把包含符号位的stream取反
+        
+        Args:
+            ps: [batch, out_ch, patches, streams, slices]
+        Returns:
+            修正后的ps（现在input是真正的有符号数）
+        """
+        if self.input_bits_per_stream != 1:
+            print(f"⚠️ Warning: input bits_per_stream={self.input_bits_per_stream} != 1, "
+                  f"sign handling may be inaccurate")
+            return ps
+        
+        sign_stream_idx = self.input_bits - 1
+        result = ps.clone()
+        result[:, :, :, sign_stream_idx, :] = -ps[:, :, :, sign_stream_idx, :]
+        return result
+    
     def compute_vectorized_conv(self, inputs, weights):
-        # Unfold input to patches
+      
         input_patches = F.unfold(inputs, self.kernel_size, self.dilation, self.padding, self.stride)
         batch_size, patch_features, num_patches = input_patches.shape
-         # 🆕 在位切片之前添加VQ
-        vq_loss = torch.tensor(0.0, device=weights.device)
-        
-        if self.vq_layer is not None:
-            # 展平权重
-            weights_flat = weights.view(-1, 1)
-            
-            # VQ量化
-            weights_quantized, vq_loss = self.vq_layer(weights_flat)
-            
-            # 恢复形状
-            weights = weights_quantized.view(weights.shape)
-
-        # Bit streaming for inputs
-        input_streams = VectorizedInputBitStreaming.apply(
-            input_patches, self.input_bits, self.input_frac_bits,
-            self.input_bits_per_stream, self.input_streams
-        )
-        
+        input_streams  = VectorizedInputBitStreaming.apply(
+             input_patches, self.input_bits, self.input_frac_bits,
+             self.input_bits_per_stream, self.input_streams
+         )
+       
         # Bit slicing for weights
         pos_slices, neg_slices, norm_factor = VectorizedWeightBitSlicing.apply(
-            weights, self.weight_bits, self.weight_bits_per_slice
+            weights, self.weight_bits,   self.weight_bits_per_slice
         )
         
         pos_weight_matrix = pos_slices.view(self.out_channels, -1, self.weight_slices)
@@ -206,60 +104,61 @@ class quantized_conv(nn.Module):
         total_adc_loss = torch.tensor(0.0, device=inputs.device)
         
         if self.num_subarrays > 1:
-            # Split into chunks
             input_chunks = torch.chunk(input_streams, self.num_subarrays, dim=1)
             pos_chunks = torch.chunk(pos_weight_matrix, self.num_subarrays, dim=1)
             neg_chunks = torch.chunk(neg_weight_matrix, self.num_subarrays, dim=1)
             
-            # Process each chunk separately (IMPORTANT for 1-bit ADC!)
             chunk_results = []
             for input_chunk, pos_chunk, neg_chunk in zip(input_chunks, pos_chunks, neg_chunks):
-                # MVM
-                pos_res = torch.einsum('bfps,oft->bopst', input_chunk, pos_chunk)
-                neg_res = torch.einsum('bfps,oft->bopst', input_chunk, neg_chunk)
+                pos_results = torch.einsum('bfps,oft->bopst', input_chunk, pos_chunk)
+                neg_results = torch.einsum('bfps,oft->bopst', input_chunk, neg_chunk)
+                #  # 🆕 修正符号位
+                # pos_results = self._fix_input_sign_bit(pos_results)
+                # neg_results = self._fix_input_sign_bit(neg_results) 
                 
-                # ADC quantization per chunk (preserves sign information for 1-bit)
-                pos_quantized, pos_loss = self.adc_pos(pos_res)
-                neg_quantized, neg_loss = self.adc_neg(neg_res)
+                pos_quantized, pos_loss = self.adc_pos(pos_results)
+                neg_quantized, neg_loss = self.adc_neg(neg_results)               
                 
                 total_adc_loss = total_adc_loss + pos_loss + neg_loss
-                
-                # Scale this chunk
+              
                 pos_scaled = pos_quantized * self.stream_scale * self.slice_scale
                 neg_scaled = neg_quantized * self.stream_scale * self.slice_scale
                 
                 chunk_result = (pos_scaled - neg_scaled).sum(dim=(-2, -1))
                 chunk_results.append(chunk_result)
             
-            # Sum scaled results from all chunks
             final_output = torch.stack(chunk_results, dim=0).sum(dim=0)
             
         else:
-            # No subarray splitting
             pos_results = torch.einsum('bfps,oft->bopst', input_streams, pos_weight_matrix)
             neg_results = torch.einsum('bfps,oft->bopst', input_streams, neg_weight_matrix)
+            # #  # 🆕 修正符号位
+            # pos_results = self._fix_input_sign_bit(pos_results)
+            # neg_results = self._fix_input_sign_bit(neg_results)
             
             pos_quantized, pos_loss = self.adc_pos(pos_results)
             neg_quantized, neg_loss = self.adc_neg(neg_results)
             
             total_adc_loss = pos_loss + neg_loss
-            
+         
             pos_scaled = pos_quantized * self.stream_scale * self.slice_scale
             neg_scaled = neg_quantized * self.stream_scale * self.slice_scale
             
             final_output = (pos_scaled - neg_scaled).sum(dim=(-2, -1))
         
-        # Apply normalization
-        final_output = final_output * norm_factor
-        input_scale = 2 ** self.input_bits - 1
-        final_output = final_output / input_scale
         
-        # Fold back to spatial dimensions
+        final_output = final_output * norm_factor   
+        weight_quant_scale = (2 ** self.weight_bits) - 1
+        final_output = final_output / weight_quant_scale
+        
+        input_max_int =  2 ** (self.input_bits) 
+        final_output = final_output / input_max_int
+        
         output_h = self._calc_output_size(inputs.shape[2], 0)
         output_w = self._calc_output_size(inputs.shape[3], 1)
         output = F.fold(final_output, (output_h, output_w), (1, 1))
         
-        return output, total_adc_loss + vq_loss
+        return output, total_adc_loss
 
     def _calc_output_size(self, input_size, dim):
         kernel = self.kernel_size
@@ -270,19 +169,32 @@ class quantized_conv(nn.Module):
     
     def forward(self, inputs):
         if self.experiment_state == "PTQAT" and self.num_subarrays > 0:
-            if self.weight_bits > 0 or self.input_bits > 0:
-                output, vq_loss = self.compute_vectorized_conv(inputs, self.weight)
-                return output, vq_loss
-            else:
-                output = F.conv2d(inputs, self.weight, bias=None,
+           ## if self.weight_bits > 0 or self.input_bits > 0:
+                output, adc_loss = self.compute_vectorized_conv(inputs, self.weight)
+                return output, adc_loss
+        elif self.experiment_state == "QAT":
+
+                qa = InputQuantization.apply(inputs, self.input_bits, self.input_frac_bits)
+                qw = WeightQuantization.apply(self.weight, self.weight_bits)
+                output = F.conv2d(qa, qw , bias=None,
                               stride=self.stride, padding=self.padding,
                               dilation=self.dilation, groups=self.groups)
+              
                 return output, torch.tensor(0.0, device=inputs.device)
-        else:
+        elif self.experiment_state == "pretraining" or self.experiment_state == "pruning":
             output = F.conv2d(inputs, self.weight, bias=None,
                           stride=self.stride, padding=self.padding,
                           dilation=self.dilation, groups=self.groups)
             return output, torch.tensor(0.0, device=inputs.device)
+
+
+
+
+
+
+
+
+
 
 
 
